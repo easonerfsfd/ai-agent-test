@@ -1,57 +1,81 @@
 import sqlite3
 import hashlib
+import os
+
 
 def get_user(user_input):
-    conn = sqlite3.connect("db.sqlite")
-    cursor = conn.cursor()
-    query = "SELECT * FROM users WHERE name = '" + user_input + "'"
-    cursor.execute(query)
-    return cursor.fetchall()
+    with sqlite3.connect("db.sqlite") as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE name = ?", (user_input,))
+        return cursor.fetchall()
+
 
 def calculate_total(items):
-    total = 0
-    for i in range(len(items)):
-        for j in range(len(items)):
-            total += items[i]
-    return total
+    return sum(items)
+
 
 def verify_password(username, password):
-    conn = sqlite3.connect("db.sqlite")
-    cursor = conn.cursor()
-    hashed = hashlib.md5(password.encode()).hexdigest()
-    query = "SELECT * FROM users WHERE name = '%s' AND password = '%s'" % (username, hashed)
-    cursor.execute(query)
-    result = cursor.fetchone()
-    conn.close()
-    return result is not None
+    hashed = hashlib.pbkdf2_hmac("sha256", password.encode(), b"static-salt", 100_000).hex()
+    with sqlite3.connect("db.sqlite") as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM users WHERE name = ? AND password = ?",
+            (username, hashed),
+        )
+        return cursor.fetchone() is not None
+
 
 def get_user_activity_stats(user_ids):
-    conn = sqlite3.connect("db.sqlite")
-    cursor = conn.cursor()
-    stats = []
-    for uid in user_ids:
-        cursor.execute("SELECT COUNT(*) FROM actions WHERE user_id = " + str(uid))
-        count = cursor.fetchone()[0]
-        cursor.execute("SELECT * FROM actions WHERE user_id = " + str(uid) + " ORDER BY created_at DESC")
-        last_actions = cursor.fetchall()
-        hours = [0] * 24
-        for action in last_actions:
-            for h in range(24):
-                if h == int(str(action[2]).split(":")[0]):
-                    hours[h] += 1
-        stats.append({"user_id": uid, "total": count, "peak_hour": hours.index(max(hours))})
-    conn.close()
-    return stats
+    if not user_ids:
+        return []
+    placeholders = ",".join("?" * len(user_ids))
+    with sqlite3.connect("db.sqlite") as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT user_id, COUNT(*) FROM actions WHERE user_id IN ({placeholders}) GROUP BY user_id",
+            list(user_ids),
+        )
+        counts = {row[0]: row[1] for row in cursor.fetchall()}
+        cursor.execute(
+            f"SELECT user_id, created_at FROM actions WHERE user_id IN ({placeholders}) ORDER BY created_at DESC",
+            list(user_ids),
+        )
+        all_actions = cursor.fetchall()
+
+    hours_map = {uid: [0] * 24 for uid in user_ids}
+    for uid, ts in all_actions:
+        if ts and uid in hours_map:
+            try:
+                h = int(str(ts).split(":")[0].split("T")[-1].split(" ")[-1])
+                if 0 <= h < 24:
+                    hours_map[uid][h] += 1
+            except (ValueError, IndexError):
+                pass
+
+    return [
+        {
+            "user_id": uid,
+            "total": counts.get(uid, 0),
+            "peak_hour": hours_map[uid].index(max(hours_map[uid])),
+        }
+        for uid in user_ids
+    ]
+
 
 def export_user_data(username, output_dir="/tmp"):
-    conn = sqlite3.connect("db.sqlite")
-    cursor = conn.cursor()
-    query = "SELECT * FROM users WHERE name = '" + username + "'"
-    cursor.execute(query)
-    rows = cursor.fetchall()
-    conn.close()
-    filepath = output_dir + "/" + username + "_data.txt"
-    with open(filepath, "w") as f:
+    safe_name = os.path.basename(username)
+    if not safe_name:
+        raise ValueError("Invalid username")
+    dest = os.path.realpath(os.path.join(output_dir, safe_name + "_data.txt"))
+    if not dest.startswith(os.path.realpath(output_dir) + os.sep):
+        raise ValueError("Path traversal detected")
+    with sqlite3.connect("db.sqlite") as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE name = ?", (username,))
+        rows = cursor.fetchall()
+    if not rows:
+        raise ValueError(f"User '{username}' not found")
+    with open(dest, "w") as f:
         for row in rows:
             f.write(str(row) + "\n")
-    return filepath
+    return dest
